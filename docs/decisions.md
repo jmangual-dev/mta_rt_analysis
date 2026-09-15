@@ -330,3 +330,141 @@ look best precisely when service is worst.
 demonstrably ran (stop list shrank over time) have vehicle entities in most or
 all of their polls? If running trips also have coverage gaps, the rule needs a
 threshold rather than a binary test.
+
+---
+
+## 2026-09-15: Poller moved to Lambda, ahead of schedule
+
+**Context.** The poller ran locally under `caffeinate -s`, which held cleanly
+overnight (1,702 objects, zero failures, no sleep gaps). But the machine is a
+laptop. Working away from home means going offline, and every poll attempted
+offline is data permanently lost — a failed fetch cannot be recovered later,
+because a retried fetch returns a different snapshot.
+
+**Decision.** Migrate the poller to Lambda now rather than in week two.
+
+**Decided by:** the local host's failure mode is tied to where I am, not to
+anything about the workload. Deferring the migration meant accumulating
+collection gaps for no reason.
+
+**What changed in the code:**
+- `requests` replaced with `urllib.request` (stdlib). This removes the only
+  third-party dependency, so the function deploys as a single pasted file with
+  no build step and no zip. `boto3` ships with the Lambda runtime.
+- No try/except. An uncaught exception marks the invocation failed, which
+  surfaces in CloudWatch metrics. Catching it would make every invocation look
+  successful.
+- `BUCKET` read from an environment variable with `os.environ[...]`, not
+  `.get()`, so a missing value fails at import with a clear error rather than
+  at the S3 call with a confusing one.
+- boto3 client created at module scope, so warm invocations reuse it.
+
+---
+
+## 2026-09-15: Execution role replaces the static access key
+
+**Decision.** The Lambda uses an IAM execution role. The `mta-rt-poller` user
+and its access key are deleted.
+
+**Why this was not possible before:** roles work by AWS verifying the identity
+of the caller. Lambda runs inside AWS, so that is automatic — credentials are
+injected, temporary, and rotated continuously, and `poll_handler.py` has no
+`profile_name` and no stored secret. A laptop has no identity AWS can verify,
+which is why the static key existed at all.
+
+**Closes:** the "revisit when the Lambda lands" note on the 2026-09-14
+credentials entry. Manual runs now use `aws login` (my own identity, correctly
+attributed) or `aws lambda invoke` (the execution role, same code path as
+production). Neither needs a stored key.
+
+**General rule this follows:** anything running on AWS compute uses a role.
+Users are for humans and for systems outside AWS.
+
+---
+
+## 2026-09-15: One schedule, one function, two fetches per invocation
+
+**Context.** Polling every 30 seconds requires sub-minute scheduling.
+
+**Decision.** A single EventBridge Scheduler rate schedule firing once a
+minute. The function fetches, sleeps 30 seconds, fetches again.
+
+**Rejected:**
+
+- *Two schedules offset 30 seconds apart, targeting one function.* The
+  preferred design: no billed idle time, and two genuinely independent
+  invocations with no drift, since each fires against wall-clock time.
+  **Rejected on a platform limit, not preference** — EventBridge Scheduler's
+  cron has no seconds field, and rate schedules only accept minute-resolution
+  start times. A sub-minute offset is not expressible.
+- *SQS with delayed delivery.* Avoids the billed sleep by having the first
+  invocation enqueue a 30-second-delayed message that triggers the second.
+  Rejected as using a queue for scheduling: adds at-least-once duplicate
+  delivery, approximate timing, another IAM policy, and its own DLQ, to save
+  an amount of Lambda time that is inside the free tier. Queues decouple a
+  producer from a consumer running at a different rate; there is one producer,
+  one consumer, and a fixed rate here.
+- *Step Functions with a Wait state.* The one option that genuinely solves the
+  idle-cost problem, since waits are free and it bills per state transition.
+  Rejected on cost: four transitions per minute is ~172k/month, and past the
+  4k free tier that is ~$4.30/month — most of a $5 budget, to save fractions
+  of a cent.
+- *Self-invocation after completion.* Rejected as an anti-pattern. No external
+  rate limit, so a bug that double-invokes compounds every cycle; a single
+  failed invocation stops the chain permanently rather than losing one poll;
+  the schedule becomes invisible to anyone reading the infrastructure; and
+  timing drifts with each cycle's duration. Scheduling belongs in a scheduler.
+- *Lambda durable execution.* Checkpoint/replay for multi-step workflows that
+  suspend and resume. There is one step taking two seconds, nothing to
+  checkpoint, and retries are actively unwanted.
+
+**Cost:** ~43,200 invocations/month at ~33 billed seconds, 128MB ≈ 178k
+GB-seconds, inside the 400k free tier. Thinner margin than a single-fetch
+design would have, but free.
+
+**Revisit when:** polling more than one feed. At eight feeds the workload
+becomes fan-out rather than one step twice, and Step Functions' Map state
+becomes the right tool — because the problem changed shape, not because the
+budget grew.
+
+---
+
+## 2026-09-15: Asynchronous retries disabled
+
+**Context.** During the cutover, one invocation failed (the new sleeping code
+deployed before the function timeout was raised from 3s to 60s). Lambda
+retried the failed async invocation 90 seconds later — same RequestId,
+`a06aa9b8-6b2e` — and the retry ran concurrently with the next scheduled
+invocation. Object spacing went 8s, 23s, 8s, 20s instead of a clean 30.
+
+**Decision.** Retry attempts set to 0.
+
+**Decided by:** the same reasoning as "let failed polls fail" (2026-09-14). A
+retried fetch returns a different snapshot, so the retry recovers nothing. It
+adds a duplicate sample at an unpredictable time and hides the real failure
+rate behind two silent attempts. With retries off, a failure goes straight to
+the CloudWatch `Errors` metric — and, once configured, to the DLQ.
+
+**Note on timeouts, since they share a name:** `TIMEOUT = 10` in the code is
+the socket timeout on the HTTP request. The 60-second Lambda timeout is the
+platform's limit on the whole invocation. They nest, and the inner one must be
+smaller: worst case is 10 + 30 + 10 = 50s. If the socket timeout exceeded the
+Lambda timeout, a slow feed would produce a generic `Task timed out` instead
+of a readable `URLError`.
+
+---
+
+## 2026-09-15: Collection handoff, local to Lambda
+
+Verified in the data rather than assumed. During the overlap both pollers ran,
+producing alternating 9s/21s gaps. After `pkill -f poll.py`, spacing settled to
+a clean alternating 29s/31s.
+
+The alternation is structural, not drift: the first fetch lands ~1s into an
+invocation, the second at ~31s after the sleep, and the next invocation starts
+60s after the first. Jitter is Lambda start latency, roughly a second.
+
+Handoff boundary for the data-quality section: local collection ran from
+2026-09-14 21:55 to 2026-09-15 ~21:30 ET. Lambda collection begins 2026-09-15
+21:29 ET. The brief overlap produced denser-than-30s sampling, which the
+idempotent loader handles without special casing.
