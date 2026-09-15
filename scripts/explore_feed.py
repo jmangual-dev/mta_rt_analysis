@@ -1,5 +1,7 @@
-import boto3, gzip
+import gzip
 from collections import Counter
+
+import boto3
 from google.transit import gtfs_realtime_pb2
 
 BUCKET = "mta-rt-raw-jm3635"
@@ -29,7 +31,7 @@ vehicle_count = 0
 for i, key in enumerate(keys, 1):
     if i % 100 == 0:
         print(f"{i}/{len(keys)}", flush=True)
-    
+
     try:
         body = s3.get_object(Bucket=BUCKET, Key=key)["Body"].read()
         feed = gtfs_realtime_pb2.FeedMessage()
@@ -76,5 +78,10 @@ print("distinct stops:", len(stops))
 print("bad_objects:", bad)
 print("vehicle entities:", vehicle_count)
 print("current_status values:", dict(status))
-print("missing status/stop/seq/ts:",
-      v_missing_status, v_missing_stop, v_missing_seq, v_missing_ts)
+print(
+    "missing status/stop/seq/ts:",
+    v_missing_status,
+    v_missing_stop,
+    v_missing_seq,
+    v_missing_ts,
+)
