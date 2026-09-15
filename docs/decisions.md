@@ -142,3 +142,191 @@ in place so a hung connection cannot stack up processes.
 
 **Revisit when:** the Lambda lands. A DLQ then provides observability, which is
 what the README's failure count will actually be reporting.
+
+## 2026-09-15: Schema constraints verified against real data, not assumed
+
+**Context.** The observations schema declares several `NOT NULL` columns and a
+`char(1)`-width direction. All of those are assumptions about feed behavior.
+
+**Decision.** Before writing the DDL, ran a throwaway script (`explore_feed.py`)
+over every object collected so far: 1,847 payloads, 7.45M stop observations,
+207,725 vehicle entities.
+
+Results:
+- `route_id` missing: 0 → safe as `NOT NULL`
+- `stop_id` lengths: all 4 characters → clean `[:-1]` / `[-1]` split
+- direction suffixes: only `N` and `S` → single character holds
+- vehicle `stop_id`, `current_stop_sequence`, `timestamp` missing: 0 each
+- unparseable objects: 0 → archive is sound
+- routes present: 1, 2, 3, 4, 5, 6, 6X, 7, 7X, GS
+
+**Decided by:** cost of being wrong. A `NOT NULL` that turns out to be false
+fails at load time on data that cannot be re-fetched.
+
+**Carried forward:** `6X` and `7X` are express variants. A rider at a
+local-only stop is not served by an express that passes through, so headway
+logic must decide explicitly whether express counts. Not yet resolved.
+
+---
+
+## 2026-09-15: stop_id stored verbatim, station and direction derived
+
+**Decision.** Keep `stop_id` exactly as the feed gives it (`111N`), and add
+`station_id` and `direction` as derived columns alongside.
+
+**Rejected:**
+- *Store only the split columns.* Loses fidelity to the source; if the split
+  assumption is ever wrong, the original value is unrecoverable.
+- *Store only `stop_id`.* Every query would parse the string, and the natural
+  grouping (station + direction) would be implicit rather than indexable.
+
+**Decided by:** the derived columns cost almost nothing, and keeping the raw
+value means a wrong parsing assumption is fixable by reloading rather than
+by re-collecting.
+
+---
+
+## 2026-09-15: Timestamps as timestamptz, not epoch integers
+
+**Decision.** All time columns are `timestamptz`. Feed epochs are converted at
+load time.
+
+**Rejected:** *Store raw `bigint` epochs.* Faithful to the source and avoids a
+conversion, but pushes timezone handling into every query forever. Postgres
+handles `AT TIME ZONE 'America/New_York'` and DST correctly; hand-rolled epoch
+math does not.
+
+**Decided by:** this is the boundary where UTC storage meets Eastern
+presentation (see 2026-09-14 partitioning entry). Converting once at the
+boundary is the whole point of having a boundary.
+
+---
+
+## 2026-09-15: Unique constraint makes loads idempotent
+
+**Context.** The loader will be interrupted, re-run after parsing fixes, and
+pointed at overlapping prefixes. Without protection, every re-run duplicates
+rows and silently corrupts downstream headway math.
+
+**Decision.** `UNIQUE (fetched_at, trip_id, start_date, stop_id)` on
+observations, `UNIQUE (fetched_at, trip_id, start_date)` on vehicles, with
+`ON CONFLICT DO NOTHING` on insert. `fetched_at` is parsed from the S3 object
+key rather than taken from the clock, so a reload reproduces identical rows.
+One transaction per object, so an interruption always leaves a clean boundary.
+
+**Rejected:**
+- *Track processed keys in a separate table.* More moving parts, and still
+  wrong if a run dies between insert and bookkeeping.
+- *Truncate and reload.* Fine now, impossible once the table holds months.
+
+**Verified:** loaded `hour=16` (120 objects, 692,152 rows), re-ran the same
+prefix, row count unchanged at 692,152. Second run inserted zero.
+
+---
+
+## 2026-09-15: source_key column on every row
+
+**Decision.** Every observation and vehicle row records the S3 key it was
+parsed from.
+
+**Rejected:** *Rely on `fetched_at` alone.* It is derived from the key, so it
+identifies the payload indirectly, but it cannot be used to delete and reload
+a specific object without string reconstruction.
+
+**Decided by:** reprocessing. Fixing a parsing bug means
+`DELETE WHERE source_key = ...` then re-running that object. Also gives a
+coverage audit: `SELECT DISTINCT source_key` diffed against the bucket listing
+shows exactly which payloads have been loaded.
+
+**Cost:** ~60 bytes per row against a table taking ~12M rows/day. Accepted.
+
+---
+
+## 2026-09-15: Store vehicle position entities
+
+**Context.** Each poll contains two entity types: `trip_update` (predictions,
+~5,800 stop rows per poll) and `vehicle` (positions, ~160 rows per poll).
+Vehicles are ~3% the volume of observations.
+
+**Decision.** Store both, in separate tables.
+
+**Rejected:**
+- *Discard vehicles.* They are not needed to compute headways directly.
+- *Merge into one table.* Different shape (one row per trip vs one row per
+  stop per trip) and different purpose.
+
+**Decided by:** observations are what the arrival inference is built on;
+vehicles are independent evidence of where a train actually is. Having a
+second, differently-derived signal is what makes the inference checkable
+rather than merely plausible. This turned out to matter the same day — see the
+arrival-detection entry below.
+
+`current_status` is stored as the raw enum integer, and as NULL when the feed
+omits it (~38% of entities). Absent is almost certainly `IN_TRANSIT_TO`, the
+proto3 default and therefore not serialized, but recording NULL keeps that an
+interpretation for the query layer rather than a fact written into the table.
+
+---
+
+## 2026-09-15: Loader is batch and decoupled from the poller
+
+**Decision.** `poll.py` runs continuously and only archives bytes. `load.py`
+is a separate batch job, run manually against an arbitrary S3 prefix.
+
+**Rejected:**
+- *Parse and insert inside the poller.* One fewer moving part, but couples the
+  thing that cannot afford to fail to the thing most likely to have bugs, and
+  makes reprocessing impossible.
+- *Continuous loader.* Slower development loop; nothing gains from it while
+  parsing logic is still changing.
+
+**Decided by:** the source determines the schedule. Ingest must be real-time
+because the feed is ephemeral. Parsing can be batch because the archive is
+durable. The same split shows up in the IAM policies: the poller can only
+`PutObject`, the loader can only `GetObject` and `ListBucket`, and neither can
+do the other's job.
+
+**Revisit when:** parsing stabilizes. Lambda's 15-minute limit makes it a poor
+host for backfills, so a scheduled hourly Lambda plus a manual backfill path,
+or a scheduled container, are the likely options. Not resolved.
+
+---
+
+## 2026-09-15: Arrival detection requires a corroborating vehicle entity
+
+**Context.** The feed never states that a train arrived. Stops drop off the
+front of a trip's `stop_time_update` list as the train passes them, so the
+obvious inference is: a stop disappearing from a trip means an arrival.
+
+**That inference is wrong, and the data shows it.** Trip `063100_2..N02R`
+appeared in 55 consecutive polls (12:00:12 to 12:27:13) with all 48 of its
+stops present in every single one. The list never shrank by one entry. Its
+first stop was scheduled for 10:33, 87 minutes before the window observed. It
+had no vehicle entity in any poll. Then it vanished from the feed entirely.
+
+This is a scheduled trip that never ran. Naive disappearance logic would have
+recorded **48 simultaneous arrivals for a train that did not exist**. Roughly
+100 of ~260 trips per poll have predictions but no vehicle position, so this
+is not an edge case.
+
+**Decision.** An arrival is recorded only when the stop disappears from the
+trip's list *and* the trip has a corroborating vehicle entity. Arrival time is
+the last observed prediction for that stop before disappearance.
+
+**Rejected:**
+- *Disappearance alone.* Produces phantom arrivals at the scale shown above.
+- *Prediction convergence alone* (last prediction within ~60s of `fetched_at`).
+  Better, but a never-started trip's predictions do not converge — they freeze
+  at their scheduled values and then vanish, and a frozen past-tense value
+  looks exactly like an arrival.
+- *Trusting the GTFS-RT `schedule_relationship` field.* Worth reading, but MTA
+  populates it inconsistently; not a basis for the primary rule.
+
+**Decided by:** the bug hides the thing being measured. Cancellations are
+service unreliability, and converting them into on-time arrivals makes the p90
+look best precisely when service is worst.
+
+**Open question for next session:** verify the inverse. Do trips that
+demonstrably ran (stop list shrank over time) have vehicle entities in most or
+all of their polls? If running trips also have coverage gaps, the rule needs a
+threshold rather than a binary test.
