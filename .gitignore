@@ -1,0 +1,7 @@
+.venv/
+poll.log
+poll.pid
+nohup.out
+__pycache__/
+*.pyc
+.DS_Store
