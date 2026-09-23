@@ -747,3 +747,255 @@ during a disruption.
 **Next:** pull the static GTFS. It resolves the platform question and
 supplies station names, which the frontend needs regardless — "120S" means
 nothing to a user.
+
+---
+
+## 2026-09-20: Static GTFS added to the repo, not archived to S3
+
+**Context.** The realtime feed needed a companion: station names for the
+frontend, and the parent-station hierarchy to settle the platform question.
+
+**Decision.** Commit `stops.txt`, `routes.txt`, `calendar.txt` and
+`calendar_dates.txt` to `data/gtfs-static/`. Do not archive to S3.
+
+**Why the opposite treatment from the realtime feed:** the rule is that
+ephemeral data goes to object storage because a missed poll is unrecoverable,
+and stable data goes in git because the version any query ran against should
+be visible in the diff. Static GTFS changes a handful of times a year at a
+stable URL.
+
+**Rejected:** *the supplemented GTFS feed* (`gtfs_supplemented.zip`, updated
+hourly, covers seven days forward). It would improve matching realtime trips
+to scheduled ones and distinguish planned service changes from real-time
+operational calls, which bears directly on the `/` and `=` designators. But
+it cannot be retrieved for the past, so it says nothing about the days
+already collected, and it would need its own archiving Lambda to be useful
+later. Deferred; noted that starting to archive it now is the only way to
+have it later.
+
+**Not committed:** `stop_times.txt` and the rest of the zip. Several million
+rows, not needed yet.
+
+**Schedule period: 2026-05-26 to 2026-10-31.** This copy expires then.
+
+---
+
+## 2026-09-20: Platform topology is not in either feed. Deferred, not solved.
+
+**The question.** Stop 120S (96 St southbound) carries the 1, 2 and 3 — 186,
+118 and 129 departures on one day. Headways partitioned by stop alone
+interleave three services. Partitioning by `(stop_id, route_id)` fixes the
+arithmetic, but the rider-facing question remains: is a combined "next train"
+figure correct for someone standing on that platform?
+
+**What the static GTFS says.** Nothing useful. 96 St is three rows:
+
+    stop_id  stop_name  location_type  parent_station
+    120      96 St      1
+    120N     96 St                     120
+    120S     96 St                     120
+
+Direction only. No local/express children. **Confirmed unsolvable from either
+feed.**
+
+**Why it matters, and why my first framing was wrong.** I initially assumed
+96 St splits local and express onto separate platforms. It does not — 96 St,
+72 St and 42 St are cross-platform transfer stations where local and express
+in the same direction share one island platform, which is the whole point of
+the design. So a combined figure is *correct* at most stations. The
+counterexample is 34 St, where the 1/2/3 split across three platforms with
+the express island shared between directions.
+
+So: combined headway is right at most stations and wrong at a few, not the
+reverse.
+
+**Decision.** Report per `(stop_id, route_id)`. A combined per-station figure
+is computable and honest if labelled as station service frequency rather than
+as one rider's wait.
+
+**The fix, priced and deferred:** a hand-built mapping of which routes share
+a platform in each direction. On the A division that is roughly a dozen
+ambiguous stations, most being local-only single-platform. It is a day of
+manual data entry with no architectural component, and it can be added later
+as a join at query time without touching anything upstream.
+
+**Also found:** route-to-station mapping is not static even within a day.
+121S and 122S are 1-train stops (187 departures each) that also saw 16
+departures of the 2 — express trains running local, most likely overnight or
+during a disruption.
+
+---
+
+## 2026-09-22: Origin terminals publish schedule, not observation
+
+**Found while sanity-checking the first headway output.** At 101S (Van
+Cortlandt Park, the 1's northern terminal) overnight departures landed on
+22:04:30, 22:14:30, 01:05:30, 01:25:30 — every one on the half-minute,
+every gap exactly 20:00. Real service does not do that.
+
+Ten stops down the line at 120S over the same window: 01:02:14, 01:16:19,
+01:54:55, with gaps of 14:05, 16:59, 21:37. Arbitrary seconds, scatter around
+20 minutes. That is observation.
+
+**Cause.** At an origin terminal the train sits before departing, so its
+prediction stays at the scheduled value and never converges on an actual
+departure. The spec notes the same thing from the other direction: predicted
+times are not updated when a train is not moving.
+
+**Terminals are identifiable empirically, with no maintained list.** Grouping
+by `(stop_id, route_id)` and measuring the share of departures landing on :00
+or :30 seconds gives a clean separation. Eleven pairs sit at exactly 100%:
+
+    901N/GS  902S/GS  101S/1  142N/1  401S/4  501S/5
+    601S/6   201S/2   247N/2  247N/5  257N/3  250N/4
+
+Random seconds would hit those two values ~3.3% of the time, so 100% is
+unambiguous. A middle band (701S/7 87.8%, 640N/6 86.3%, 702S/7 60.4%,
+726N/7 47.1%) is partial: at a busy terminal a train that arrives late and
+turns quickly produces an observed time, while one already waiting departs on
+schedule.
+
+**Consequence.** Terminal headways describe the timetable, not reality, and
+should be excluded or labelled in rider-facing statistics. Overall 7.7% of
+departures land on round seconds against a 3.3% chance baseline, so roughly
+3,200 of 72,052 are schedule-derived.
+
+**This also explains the earlier count discrepancy.** `072100_1..S15R` shed
+37 stops but produced 36 departures. The missing one is its origin (101S, lag
++132s): a stale terminal prediction pushed past the ±120s filter. The filter
+was already excluding most terminal departures, which is arguably correct
+behaviour arrived at by accident. Flagging terminals explicitly is a to-do.
+
+---
+
+## 2026-09-22: Headways view, and what it deliberately does not handle
+
+`schema/07_headways.sql` defines `headways` as `lag()` over departures,
+partitioned by `(stop_id, route_id)`, ordered by `departed_at`, filtered to
+`trip_type = '0'`.
+
+**First real output** — the 1 southbound at 96 St, weekday mornings 08:00 to
+10:00, from 50 observed departures:
+
+    median headway 3.6 min,  p90 6.5 min
+
+Plausible for rush hour on the 1, and derived end to end from raw protobuf.
+
+**Two things the view does not handle, documented at the definition because a
+view looks authoritative:**
+
+1. *Collection gaps.* `lag()` spans the whole table, so a lapse between
+   loaded days produces one enormous false headway per stop/route pair at the
+   boundary.
+2. *Origin terminals*, per the entry above.
+
+**The gap threshold was set from the distribution, not by guess.** Headways
+decay smoothly to ~80 minutes, then run as a thin tail through ~290, then
+**1,790 rows pile into a 300+ overflow bucket**. That spike is the two
+multi-day collection lapses; everything below it decays like real service. An
+initial 60-minute cutoff was discarding genuine overnight headways — there is
+a real cluster at 61-80 minutes at low-frequency stops.
+
+**Interim decision:** filter at 120 minutes. Keeps essentially all genuine
+service, drops all 1,790 artifacts, and is defensible as "no subway headway
+exceeds two hours."
+
+**The correct fix, deferred:** flag headways that span a known collection
+gap, derived from the observation timestamps rather than inferred from
+magnitude. "I excluded headways spanning a known collection gap" survives
+scrutiny in a way "I filtered anything over N minutes" does not. The
+difference is a few hundred rows out of 200,000, and a continuous backfill
+largely dissolves the problem anyway.
+
+---
+
+## 2026-09-22: Load throughput measured — the bottleneck is S3, not Postgres
+
+**One full day (2,880 objects, 12.2M observations): 11 minutes, at 27% CPU.**
+
+That utilisation is the finding. The process is idle three-quarters of the
+time waiting on S3 round trips. Parsing and inserting are not the constraint,
+which means:
+
+- The full backfill (22,892 objects, ~8 days) is roughly **90 minutes
+  sequential** — a leave-it-running job, not an overnight one.
+- Dropping indexes before a bulk load would not help much, since index
+  maintenance is not what is slow.
+- A thread pool of 8-10 on the S3 fetches would likely cut it to 15-20
+  minutes. Not built; worth knowing the lever exists.
+
+**Storage:** ~290 bytes per observation row with indexes (7.2GB for 25M
+rows). A year of continuous collection is ~800GB. 380GB free locally, so the
+backfill itself fits comfortably; the yearly figure is what drives the
+architecture decision below.
+
+**Correction to an earlier estimate in this log:** I had assumed 25-35
+minutes per day's load without measuring it, then repeated that guess as
+though it were measured. It was wrong by 3x. Measured now.
+
+---
+
+## 2026-09-22: No RDS. Parquet in S3 plus Athena, and static JSON output.
+
+**Context.** The natural next step was RDS, and it does not fit the budget.
+RDS costs are two separate things: **instance hours** (~$12-15/month
+regardless of contents) and **storage** (scales with volume). Moving
+observations out of Postgres solves the second and not the first — even a
+tiny database holding only departures still pays for the instance.
+
+Against a $5 soft cap and $10 hard cap, that is disqualifying on its own.
+Observations at ~800GB/year would add ~$80/month in RDS storage on top.
+
+**Decision.** No database instance at any layer.
+
+    raw/      protobuf snapshots          (poller Lambda, already live)
+      ↓       loader Lambda, hourly
+    parsed/   observations as Parquet     (one file per input object)
+      ↓       Athena: CREATE TABLE AS SELECT
+    derived/  departures + headways as Parquet
+      ↓       nightly percentile query
+    static/   per-station JSON            → frontend reads directly
+
+**Why Parquet.** Columnar, so a query touching 2 of 11 columns reads ~2/11 of
+the file. Compresses far better than row-oriented data given how repetitive
+these columns are. Athena bills per byte scanned (~$5/TB), so the format
+directly reduces the bill, and the existing `year=/month=/day=/hour=`
+partitioning is already the Hive convention Athena reads natively — a choice
+made on day one for unrelated reasons.
+
+**Idempotency without a database.** One output Parquet file per input object,
+keyed to match. Reprocessing overwrites rather than appends, which replaces
+the `ON CONFLICT DO NOTHING` that Postgres was providing.
+
+**Why the frontend can be static.** The output is small: ~32k rows at
+station × route × day-type × hour, or ~6.6k at coarser time bands. Roughly
+400KB gzipped for the whole system, a few KB per station file. **More data
+makes the numbers better, not the files bigger** — a p90 from 500 samples is
+the same two bytes as one from 50. The expensive query runs once nightly; the
+frontend renders numbers.
+
+Carry a sample count `n` in the JSON. With six days of data some
+station-hour buckets have single-digit samples, and a p90 from three
+observations is noise; the frontend should say so rather than show a
+confident wrong number.
+
+**Costs accepted:**
+- `pyarrow` is ~100MB, too large for a Lambda zip. The loader needs a
+  container image. This is the main new thing to learn and it is useful for
+  the exam regardless.
+- Athena query latency is 2-10s with fixed startup overhead. Fine for
+  derivation, unusable for an interactive dropdown — which is exactly why the
+  frontend reads pre-computed JSON rather than querying live.
+- No unique constraints, no updates, no indexes. File naming and partitioning
+  carry what the database was carrying.
+
+**Honest framing for the README:** the $5 target is self-imposed, and it was
+set when the project was S3 and Lambda only. It is a real constraint that has
+produced real design decisions — this entry being the clearest — but "I would
+use RDS in production, here is what it costs and why" is the fair statement,
+not "RDS was the wrong choice."
+
+**Revisit when:** S3 storage for Parquet observations approaches the cap
+(~$18/month at a year of data). Lifecycle rules to Glacier after 30 days
+address that, since older observations are queried rarely if ever once
+departures are derived.
