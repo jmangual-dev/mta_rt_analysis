@@ -1,0 +1,1 @@
+CREATE INDEX observations_stop_fetched ON observations (stop_id, fetched_at);
