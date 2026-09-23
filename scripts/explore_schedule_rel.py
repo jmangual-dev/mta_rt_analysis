@@ -2,7 +2,8 @@ import gzip
 from collections import Counter
 
 import boto3
-from google.transit import gtfs_realtime_pb2
+
+from com.google.transit.realtime import gtfs_realtime_pb2
 
 BUCKET = "mta-rt-raw-jm3635"
 s3 = boto3.Session(profile_name="loader").client("s3")
