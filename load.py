@@ -11,21 +11,23 @@ interrupted run can simply be repeated.
 
 import gzip
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import boto3
 import psycopg
-from google.transit import gtfs_realtime_pb2
+
+import gtfs_realtime_NYCT_pb2 as nyct_pb2
+from com.google.transit.realtime import gtfs_realtime_pb2
 
 BUCKET = "mta-rt-raw-jm3635"
 DSN = "dbname=mta_rt"
 
 OBS_SQL = """
-    INSERT INTO observations
+        INSERT INTO observations
         (fetched_at, feed_timestamp, trip_id, start_date, route_id,
-         stop_id, station_id, direction, arrival_time, departure_time,
-         source_key)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+         stop_id, station_id, direction, train_id, trip_type, is_assigned,
+         arrival_time, departure_time, source_key)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     ON CONFLICT DO NOTHING
 """
 
@@ -33,8 +35,8 @@ VEH_SQL = """
     INSERT INTO vehicles
         (fetched_at, feed_timestamp, vehicle_timestamp, trip_id, start_date,
          route_id, stop_id, station_id, direction, current_stop_sequence,
-         current_status, source_key)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+         train_id, trip_type, current_status, source_key)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     ON CONFLICT DO NOTHING
 """
 
@@ -52,7 +54,7 @@ def fetched_at_from_key(key):
 
 def service_date(s):
     """Feed gives start_date as 'YYYYMMDD'."""
-    return datetime.strptime(s, "%Y%m%d").date()
+    return date(int(s[:4]), int(s[4:6]), int(s[6:8]))
 
 
 def split_stop(stop_id):
@@ -79,20 +81,28 @@ def parse(body, key):
             v = entity.vehicle
             stop_id = v.stop_id if v.HasField("stop_id") else None
             station, direction = split_stop(stop_id) if stop_id else (None, None)
-            veh_rows.append((
-                fetched,
-                feed_ts,
-                ts(v.timestamp),
-                v.trip.trip_id,
-                service_date(v.trip.start_date),
-                v.trip.route_id,
-                stop_id,
-                station,
-                direction,
-                v.current_stop_sequence,
-                v.current_status if v.HasField("current_status") else None,
-                key,
-            ))
+            nyct = v.trip.Extensions[nyct_pb2.nyct_trip_descriptor]
+            train_id = nyct.train_id or None
+            trip_type = train_id[0] if train_id else None
+
+            veh_rows.append(
+                (
+                    fetched,
+                    feed_ts,
+                    ts(v.timestamp),
+                    v.trip.trip_id,
+                    service_date(v.trip.start_date),
+                    v.trip.route_id,
+                    stop_id,
+                    station,
+                    direction,
+                    v.current_stop_sequence,
+                    train_id,
+                    trip_type,
+                    v.current_status if v.HasField("current_status") else None,
+                    key,
+                )
+            )
             continue
 
         if not entity.HasField("trip_update"):
@@ -102,22 +112,31 @@ def parse(body, key):
         trip_id = tu.trip.trip_id
         start = service_date(tu.trip.start_date)
         route = tu.trip.route_id
+        nyct = tu.trip.Extensions[nyct_pb2.nyct_trip_descriptor]
+        train_id = nyct.train_id or None
+        trip_type = train_id[0] if train_id else None
+        is_assigned = nyct.is_assigned
 
         for stu in tu.stop_time_update:
             station, direction = split_stop(stu.stop_id)
-            obs_rows.append((
-                fetched,
-                feed_ts,
-                trip_id,
-                start,
-                route,
-                stu.stop_id,
-                station,
-                direction,
-                ts(stu.arrival.time) if stu.HasField("arrival") else None,
-                ts(stu.departure.time) if stu.HasField("departure") else None,
-                key,
-            ))
+            obs_rows.append(
+                (
+                    fetched,
+                    feed_ts,
+                    trip_id,
+                    start,
+                    route,
+                    stu.stop_id,
+                    station,
+                    direction,
+                    train_id,
+                    trip_type,
+                    is_assigned,
+                    ts(stu.arrival.time) if stu.HasField("arrival") else None,
+                    ts(stu.departure.time) if stu.HasField("departure") else None,
+                    key,
+                )
+            )
 
     return obs_rows, veh_rows
 
@@ -160,11 +179,12 @@ def main(prefix):
             total_veh += len(veh_rows)
 
             if i % 50 == 0:
-                print(f"{i}/{len(keys)}  obs={total_obs}  veh={total_veh}",
-                      flush=True)
+                print(f"{i}/{len(keys)}  obs={total_obs}  veh={total_veh}", flush=True)
 
-    print(f"done: {total_obs} observations, {total_veh} vehicles, "
-          f"{skipped} objects skipped")
+    print(
+        f"done: {total_obs} observations, {total_veh} vehicles, "
+        f"{skipped} objects skipped"
+    )
 
 
 if __name__ == "__main__":
