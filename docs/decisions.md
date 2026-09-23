@@ -468,3 +468,282 @@ Handoff boundary for the data-quality section: local collection ran from
 2026-09-14 21:55 to 2026-09-15 ~21:30 ET. Lambda collection begins 2026-09-15
 21:29 ET. The brief overlap produced denser-than-30s sampling, which the
 idempotent loader handles without special casing.
+
+---
+
+## 2026-09-16: Compiled the NYCT proto extensions
+
+**Context.** The base GTFS-realtime bindings expose none of MTA's own
+extension fields. Three open questions depended on them: how to identify
+trips that never run, how to identify skipped stops, and whether the feed
+flags rerouted trains.
+
+**Decision.** Compile `gtfs-realtime-NYCT.proto` with protoc and generate the
+base bindings alongside it, dropping the `gtfs-realtime-bindings` pip package.
+
+**Rejected:** *keeping the pip package and generating only the NYCT module.*
+The generated code imports the base spec at `com.google.transit.realtime`,
+the pip package installs it at `google.transit`. Two copies of the same
+message definitions in one process risks a duplicate-registration failure.
+One source of truth is simpler than explaining which one wins.
+
+**Cost:** imports across the codebase change to
+`from com.google.transit.realtime import gtfs_realtime_pb2`, and generated
+`_pb2.py` files are committed so nobody needs protoc to read the repo.
+Regeneration: `cd proto && protoc --python_out=.. gtfs-realtime-NYCT.proto`.
+
+**Unlocked:** `is_assigned`, `train_id`, `scheduled_track`, `actual_track`.
+
+---
+
+## 2026-09-16: schedule_relationship is not populated — confirmed, not inferred
+
+**Context.** GTFS-realtime defines `SKIPPED` on StopTimeUpdate and `CANCELED`
+on TripDescriptor. If MTA populated either, the skip-stop and never-ran
+problems would be solved by reading a field.
+
+**Finding.** Across 12.2M stop updates and 573,749 trip updates spanning two
+days, both enums were 0 in every single case.
+
+That result is ambiguous on its own — proto3 does not distinguish "set to the
+default" from "not set" — and a clean sample could just mean good service.
+Two things resolve it:
+
+1. `063100_2..N02R` was independently established as a trip that never ran
+   (55 polls, all 48 stops, no vehicle entity, is_assigned false). The
+   trip-level enum still read SCHEDULED.
+2. MTA's own spec states it directly: ScheduleRelationship is not used,
+   because there is no reliable way to link a realtime trip back to the
+   static GTFS trip. StopTimeUpdate's `schedule_relationship` is marked
+   "Not used."
+
+**Consequence.** Skip-stop and cancellation detection are heuristics by
+necessity, not by choice.
+
+---
+
+## 2026-09-16: is_assigned is the primary test for whether a trip ran
+
+**Context.** Three candidate signals for distinguishing a real train from a
+scheduled trip that never ran: absence of a VehiclePosition entity, a stop
+list that never shrinks, and the NYCT `is_assigned` flag.
+
+**Decision.** `is_assigned`, evaluated **per row**, not per trip. Vehicle
+presence is corroboration.
+
+**Why is_assigned over vehicle presence:** the VehiclePosition appears only
+once a train starts moving, which is documented behavior and visible in the
+data — `072100_1..S15R` had seven polls with predictions and no vehicle, and
+the entity appeared in the exact poll its stop count first dropped. Assignment
+happens at the origin terminal, earlier, so it discriminates sooner.
+
+**Why per row:** assignment is not a fixed trip property. Over a full day,
+**3,143 of 3,797 trips (82.78%)** change their is_assigned value at least
+once. Nearly every trip enters the feed unassigned and becomes assigned.
+(An earlier one-hour sample showed 25.7%, which was a sampling artifact: a
+short window catches most trips mid-run with assignment already settled.)
+
+**Rejected:**
+- *Disappearance alone.* Produces phantom departures at scale. A never-run
+  trip vanishes all at once, so `063100_2..N02R` would have contributed 48
+  simultaneous departures for a train that did not exist. 44% of distinct
+  trips in a given hour are unassigned.
+- *Prediction convergence alone.* A never-started trip's predictions do not
+  converge; they freeze at scheduled values and then vanish, which looks
+  exactly like an arrival.
+- *Trip-level assignment.* Would discard the 82.78% case entirely.
+
+**Corroborated independently:** Andrew-Dickinson/nyct-gtfs exposes the same
+flag as `train_assigned` and uses it the same way.
+
+---
+
+## 2026-09-16: Assignment reverses in 3.8% of trips, and departed stops can reappear
+
+**Context.** Assignment was expected to be one-way and sticky.
+
+**Finding.** 143 of 3,797 trips (3.8%) go assigned -> unassigned. None of the
+three inspected cases was a single-poll blip; all were sustained.
+
+The consequential one is `074250_2..S02R`: assigned at 12:01, **departed a
+stop at 12:04 (48 -> 47 stops)**, then unassigned at 12:10 with **the stop
+list back at 48**. The departure was undone.
+
+Operationally this reads as a work program being revoked — the spec describes
+trains at a terminal being assigned or moved to storage, and this is that in
+reverse.
+
+**Consequence.** A disappearance is not necessarily final. Taking the last
+observation of each stop happens to handle this conservatively: a reappeared
+stop looks present at the end and is excluded, so a real departure is dropped
+rather than a phantom recorded. **That is the safe direction but it is not
+deliberate handling.** Logged as a known gap.
+
+---
+
+## 2026-09-16: trip_type stored per row, filtered at query time
+
+**Context.** The first character of `train_id` is a trip type designator:
+`0` scheduled revenue, `=` reroute, `/` skip stop, `$` turn train.
+
+**Decision.** Store `train_id` verbatim plus `trip_type` as the derived first
+character, on every observation row. Do not filter at load time.
+
+**Why per row:** a trip can be redesignated mid-run. Over a full day 113
+distinct trips carry `/`, and those same trips appear with it both assigned
+and unassigned; the per-type trip counts sum past the total. A train running
+normally before being redesignated has real departures that should not be
+discarded, and stops after redesignation that should not be trusted.
+
+**Distribution over a full day** (trips, not observations): `0` 3,646,
+`/` 113, `E` 99, `=` 42, `$` 18.
+
+**Skip-stop concentration:** the 1 (31 trips) and the 6 (28) lead by a wide
+margin, which matches the operational pattern that prompted the question in
+the first place — a 1 train running 96th to 137th.
+
+---
+
+## 2026-09-16: `E` is an undocumented designator. Investigated and unresolved.
+
+`E` appears in 99 trips/day, 1.5% of trip observations, and in no
+documentation anywhere. Everything checked, and what it ruled out:
+
+- **MTA's 2012 spec and the proto comments.** List four designators. No `E`.
+- **Third-party implementations,** including Andrew-Dickinson/nyct-gtfs,
+  which returns `train_id` raw and quotes the same 2012 docstring verbatim.
+- **Route clustering.** Hypothesis: `E` is specific to a line or branch,
+  prompted by the first `E` trip observed being a 5 running to Dyre Ave,
+  whose track configuration the spec calls out separately. **Rejected** — `E`
+  appears on every route in the feed: 2 (21), 1 (20), 4 (16), 5 (15), 6 (8),
+  7X (7), 7 (7), 6X (3), 3 (2).
+- **Alert entities.** Six `E` trips on the 5 produced the largest negative
+  lag outliers, all at stops 420S/423S between 16:22 and 16:58, all predicted
+  35+ minutes later. **Zero of them carried an alert.** They were not flagged
+  as delayed; they were withdrawn.
+- **Track mismatch.** `scheduled_track` vs `actual_track` would flag a manual
+  reroute, which the spec says makes predictions unreliable. **Not testable
+  on these trips** — `actual_track` was NULL for all 176 relevant rows,
+  consistent with the spec's note that it is only set for the first remaining
+  stop of a trip. Mismatch rates by type are otherwise proportional to feed
+  share, so no signal there either.
+
+**Behaviorally, `E` looks like real service:** 96% assigned, lag distribution
+(-110/+14/+93) only mildly wider than type `0`.
+
+**Decision.** Store verbatim, treat as normal service, revisit with two weeks
+of data. The ±120s lag filter handles its outliers regardless of cause.
+
+**Also observed:** `T`, exactly once in ~975k observations. Noise, not modelled.
+
+---
+
+## 2026-09-16: Departures, not arrivals
+
+The spec is explicit and a third-party implementation confirms it: a stop is
+dropped from a trip's list when the train **departs** that station, not when
+it arrives. nyct-gtfs's own example shows a train `STOPPED_AT` a station with
+that station still present in its stop list.
+
+**Decision.** The table is `departures` and the column is `departed_at`.
+Renamed before building anything on top.
+
+For headway purposes this is arguably the better measure anyway: what a
+waiting rider experiences is the gap between departures. The difference is
+one dwell time, roughly 20-60 seconds.
+
+---
+
+## 2026-09-16: ±120s lag filter on departures
+
+**Context.** `lag_seconds = last_seen_at - departed_at` measures how stale a
+final prediction was when it vanished. It is the error bar on every headway
+derived downstream.
+
+**Measured across a full day** (76,696 candidate departures):
+median **+12s**, p05 **-51s**, p95 **+55s**. So inferred departure times are
+accurate to roughly ±1 minute, comfortably inside the resolution needed for
+headways measured in minutes. The +12s median is the expected poll-interval
+bias — a stop drops at the poll *after* departure.
+
+By trip type:
+
+| type | departures | p05 | median | p95 |
+|---|---|---|---|---|
+| `0` | 74,116 | -51 | +12 | +53 |
+| `E` | 1,623 | -110 | +14 | +93 |
+| `/` | 654 | -45 | +12 | **+417** |
+| `=` | 247 | +4 | +30 | +122 |
+| `$` | 56 | +3 | +48 | **+671** |
+
+The `/` and `$` tails **confirm the skip-stop hypothesis independently of the
+designator**: a skipped stop vanishes while its prediction is still minutes
+out and never converged. Two independent signals for a skip now exist.
+
+**Decision.** Exclude candidates outside ±120s. Discards 2,329 of 76,696
+(**3.04%**), leaving 74,367.
+
+**Why the outliers are not normal service, and why the filter is symmetric:**
+the two tails have different causes.
+- *Positive tail:* delayed trains whose predictions froze while they sat.
+  These **do** carry Alert entities — `090500_6..S01R` had 58 alerts in one
+  hour and also appeared in the lag outliers.
+- *Negative tail:* trips withdrawn before running. **No alerts.**
+
+**Rejected:** ±300s (would keep cases that are clearly not departures) and no
+filter (the ±45-minute extremes would corrupt headway percentiles).
+
+**Known cost:** the origin terminal of a trip is systematically at risk of
+exclusion. A train sits at its origin before departing, so that prediction
+goes stale in a way mid-run predictions do not. `072100_1..S15R` produced 36
+departures against 37 stops shed, and the missing one is its first stop
+(101S, lag +132s). Revisit whether origin stops need a separate threshold.
+
+---
+
+## 2026-09-16: Departure detection validated end to end
+
+`queries/build_departures.sql` materializes `departures` from `observations`.
+Four conditions, each established against real data: is_assigned true at that
+poll; the stop not still present in the trip's final poll; |lag| ≤ 120s; a
+departure time exists (`departure_time`, falling back to `arrival_time`).
+
+Idempotent via `UNIQUE (trip_id, start_date, stop_id)` and
+`ON CONFLICT DO NOTHING`, same pattern as the loader.
+
+**Result:** 74,367 departures from 12.5M observations across 3,278 trips and
+341 platforms, exactly matching the predicted count after filtering.
+
+**Validation:** `072100_1..S15R` was independently established days earlier as
+having shed 37 stops. It produced 36 departures — the discrepancy is the
+origin-terminal case noted above, not a logic error.
+
+---
+
+## 2026-09-16: Headways are per (stop_id, route_id)
+
+**Context.** The first headway query at 96th St southbound produced gaps of
+2, 15, and 18 seconds between trains. Physically impossible.
+
+**Cause.** `stop_id` is parent station plus direction, **not platform**. Stop
+120S (96th St) is served by the 1, 2, and 3 — 186, 118, and 129 departures
+respectively across one day. Computing headways without partitioning by route
+interleaves three services.
+
+**Decision.** Headways partition by `(stop_id, route_id)`.
+
+**The limitation this exposes, which is not solved:** at a station where
+routes use *different physical platforms*, a rider on the local platform
+cannot board an express, so a combined headway would overstate their service.
+At a station where routes share a platform, combining them is exactly right.
+**The realtime feed does not distinguish these cases.** Resolving it requires
+the static GTFS `stops.txt` and its parent-station hierarchy.
+
+**Also found:** route-to-station mapping is not static even within a day.
+121S and 122S are 1-train stops (187 departures each) that also saw 16
+departures of the 2 — express trains running local, most likely overnight or
+during a disruption.
+
+**Next:** pull the static GTFS. It resolves the platform question and
+supplies station names, which the frontend needs regardless — "120S" means
+nothing to a user.
