@@ -703,7 +703,7 @@ departures against 37 stops shed, and the missing one is its first stop
 
 ## 2026-09-16: Departure detection validated end to end
 
-`queries/build_departures.sql` materializes `departures` from `observations`.
+`queries/insert_departures.sql` materializes `departures` from `observations`.
 Four conditions, each established against real data: is_assigned true at that
 poll; the stop not still present in the trip's final poll; |lag| ≤ 120s; a
 departure time exists (`departure_time`, falling back to `arrival_time`).
@@ -819,11 +819,6 @@ ambiguous stations, most being local-only single-platform. It is a day of
 manual data entry with no architectural component, and it can be added later
 as a join at query time without touching anything upstream.
 
-**Also found:** route-to-station mapping is not static even within a day.
-121S and 122S are 1-train stops (187 departures each) that also saw 16
-departures of the 2 — express trains running local, most likely overnight or
-during a disruption.
-
 ---
 
 ## 2026-09-22: Origin terminals publish schedule, not observation
@@ -844,7 +839,8 @@ times are not updated when a train is not moving.
 
 **Terminals are identifiable empirically, with no maintained list.** Grouping
 by `(stop_id, route_id)` and measuring the share of departures landing on :00
-or :30 seconds gives a clean separation. Eleven pairs sit at exactly 100%:
+or :30 seconds gives a clean separation. Twelve pairs (eleven stops; 247N
+serves both the 2 and the 5) sit at exactly 100%:
 
     901N/GS  902S/GS  101S/1  142N/1  401S/4  501S/5
     601S/6   201S/2   247N/2  247N/5  257N/3  250N/4
@@ -999,3 +995,17 @@ not "RDS was the wrong choice."
 (~$18/month at a year of data). Lifecycle rules to Glacier after 30 days
 address that, since older observations are queried rarely if ever once
 departures are derived.
+
+---
+
+## 2026-10-10: Errata
+
+Housekeeping corrections to earlier entries, made in place and recorded
+here so the log stays honest about its own edits:
+
+- 2026-09-16 departure validation: referenced `queries/build_departures.sql`;
+  the file is `queries/insert_departures.sql`.
+- 2026-09-22 terminals: said "Eleven pairs" while listing twelve. Twelve
+  stop/route pairs across eleven stops (247N serves the 2 and the 5).
+- 2026-09-20 platform topology: removed a paragraph duplicated verbatim
+  from the 2026-09-16 headways entry.

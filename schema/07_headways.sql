@@ -25,12 +25,14 @@
 -- 1. Collection gaps. lag() spans the whole table, so if the poller was
 --    down between two loaded days, the first departure after the gap gets
 --    a headway measured against the last one before it. Filter on
---    headway_minutes before computing any statistic; anything over ~60
---    minutes is a gap, not service.
+--    headway_minutes before computing any statistic. Use 120 minutes:
+--    genuine overnight headways reach 61-80 minutes at low-frequency
+--    stops, so a 60-minute cutoff discards real service. See the
+--    2026-09-22 headways entry in docs/decisions.md.
 --
 -- 2. Origin terminals. At a terminal the train sits before departing, so
 --    the prediction stays at its scheduled value and the "observed"
---    departure is really the timetable. Eleven stop/route pairs show this
+--    departure is really the timetable. Twelve stop/route pairs show this
 --    at exactly 100% (101S/1 Van Cortlandt, 142N/1 South Ferry, 901N and
 --    902S on the shuttle, and so on), identifiable by departure times
 --    landing on :00 or :30 seconds. Terminal headways describe the
