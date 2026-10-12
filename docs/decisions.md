@@ -1,7 +1,13 @@
 # Decisions
 
 Append-only. Newest at the bottom. Each entry: what was decided, what was
-rejected, what decided it.
+rejected, what decided it. Corrections to earlier entries are made in place
+and listed in an Errata entry, so the log stays honest about its own edits.
+
+Written with AI assistance (Claude) as a thinking partner and drafting aid.
+Every finding here was checked against collected data before anything was
+built on it; where an initial assumption turned out to be wrong, the entry
+says so. Project overview is in the [README](../README.md).
 
 ---
 
@@ -1009,3 +1015,80 @@ here so the log stays honest about its own edits:
   stop/route pairs across eleven stops (247N serves the 2 and the 5).
 - 2026-09-20 platform topology: removed a paragraph duplicated verbatim
   from the 2026-09-16 headways entry.
+
+---
+
+## 2026-10-10: Terminal detection re-run on the full loaded window
+
+Re-running the round-seconds test over 2026-09-14 to 09-22 (605,319
+departures, `trip_type = '0'`, pairs with >50 departures) finds **14**
+stop/route pairs at exactly 100%, up from 12 on the 09-22 window.
+
+**New:** 204S/5 (Nereid Av, a part-time short-turn terminal for the 5),
+257N/4 (New Lots Av), 601S/6X (Pelham Bay, express variant).
+**Dropped:** 250N/4 (Crown Hts–Utica Av).
+
+The 4-train changes are one effect seen twice. With more overnight service
+loaded, some 4 trips originate at New Lots and pass *through* Utica, so
+Utica is no longer a pure origin and New Lots becomes one. That matches the
+late-night 3/4 swap in Brooklyn (see the 2026-10-11 entry).
+
+**Decided by:** the signature finds short-turn and part-time terminals that
+no maintained list would include, which supports detecting terminals
+empirically rather than hardcoding them.
+
+---
+
+## 2026-10-11: Headway charts, and what they surfaced
+
+`scripts/plot_headways.py` charts median and p90 headway by hour for any
+stop and route, reading the `headways` view so every image is reproducible.
+
+**Choices:**
+- *Weekdays by default.* Weekday and weekend timetables differ; mixing them
+  blurs the rush-hour pattern. `--days` switches.
+- *Hours with fewer than 10 headways dropped.* A p90 from three samples is
+  noise.
+- *Y-axis capped at 40 minutes, outliers labelled at the edge.* One thin
+  overnight hour was flattening the whole chart. Clipped values print their
+  true number, so nothing is hidden.
+- *Lines break at hours with no data.* The first version drew a straight
+  line across 18 hours when the 4 doesn't serve Nostrand Av, implying
+  all-day service. Fixed by plotting on a full 0-23 grid with NaN gaps.
+
+**Found:**
+- *Late-night 3/4 swap at Nostrand Av.* The 3 serves it ~6am-10pm, the 4
+  overnight. Recovered from observed departures alone, with no schedule data.
+- *Midnight p90 at 96 St (78 min)* comes from two ~111-minute gaps, both
+  ending ~00:52 on separate nights (09-17, 09-22). Under the 120-minute gap
+  filter, so counted as service; consistent with planned overnight work.
+- *A trip's final stop never records a departure.* The trip vanishes from
+  the feed instead of shedding that stop. 250S/4 (Crown Hts-Utica Av) shows
+  93 departures because most 4 trains terminate there. Mirror image of the
+  origin-terminal issue.
+- *Departure counts track stopping patterns, not station importance.* The 4
+  shows ~100-340 departures at Manhattan local stops against ~1,250 at
+  express stops; the smaller counts are late-night local running and
+  reroutes.
+- *Planned service changes show up in the departures.* Southbound 1 trains
+  skipped 125-103 St for most of Sat 09-19 and Sun 09-20: 137 St recorded
+  145 and 135 ordinary-service departures, 110 St only 14 and 23. Consistent
+  with a weekend service change routing riders to 96 St to double back. On
+  every weekday the two stations match exactly, which also shows the
+  departure inference is consistent station to station.
+- *Express runs for re-spacing.* Seven northbound 1 trips departed 96 St and
+  137 St with no departures in between. Six were tagged `/` at both stations;
+  one was tagged `0` at 96 St and `/` by 137 St. All seven left 96 St with a
+  longer gap to the train ahead than that hour's median (1.4-2.2x, median
+  ~1.8x); if gaps were random relative to the median, all seven landing
+  above it would happen under 1% of the time. In six of seven the gap had
+  shrunk by 1.5-3 minutes at 137 St, roughly what skipping four stops should
+  save. The exception followed another express run 17 minutes earlier the
+  same night. n=7, so a signal rather than a rate. Started from an anecdote
+  from riding the line, then checked in the data.
+
+**Follow-up:** the `headways` view's `trip_type = '0'` filter drops
+skip-stop trains at the stops they *do* serve, slightly overstating headways
+at 96 St and 137 St. Including `/` trips is likely safe, since skipped stops
+never produce a departure row (the ±120s filter excludes them). Not changed
+yet.
